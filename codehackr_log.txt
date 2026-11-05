@@ -1,0 +1,291 @@
+~/Desktop/ocal-mac main
+base ❯ codehack
+╔══════════════════════════════════════════════════════════════╗
+║            CODE::HACK  AI Expert  —  TUI Mode              ║
+║     8 MCP Servers  ·  71+ Tools  ·  4 Subagents            ║
+╚══════════════════════════════════════════════════════════════╝
+
+  Model:    z-ai/glm-5.3
+  Workdir:  /Users/xlisp/Desktop/ocal-mac
+  Session:  540f1e48-1571-4bb1-b27e-4cbae1bda984 (new)
+
+  Connecting to MCP servers...
+
+  ● filesystem-command — 12 tools
+  ● git-tools — 11 tools
+  ● code-intel — 5 tools
+  ● memory-store — 19 tools
+  ● code-review — 11 tools
+  ● multi-project — 15 tools
+  ● mermaid-chart — 5 tools
+
+  78 tools loaded from 7 servers
+  4 subagents: git_archaeologist, code_scanner, code_reviewer, workspace_coordinator
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Type your message and press Enter. Commands:
+  /help    — Show help
+  /clear   — Clear screen
+  /status  — Show connection status
+  /sessions — List past sessions
+  /quit    — Exit (shows session id)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+❯ /Users/xlisp/Desktop/ocal-win 帮我把这个软件写成 mac能跑的版本。不然老是要切换系统。
+
+  ❯ /Users/xlisp/Desktop/ocal-win 帮我把这个软件写成 mac能跑的版本。不然老是要切换系统。
+  ⏵ Tool
+  ✓ Tool
+
+看到了,这是一个 Windows 程序(OCAL),带 OpenCV 的 DLL、MFC 运行库和 SkinMagic 皮肤库。让我先看看配置文件,搞清楚这个软件是干什么的:
+  ⏵ Read /Users/xlisp/Desktop/ocal-win/config1080.txt
+  ⏵ Read /Users/xlisp/Desktop/ocal-win/focus.txt
+  ✓ Read
+  ✓ Read
+  ⏵ Read /Users/xlisp/Desktop/ocal-win/config720.txt
+  ⏵ Read /Users/xlisp/Desktop/ocal-win/config4k.txt
+  ⏵ Read /Users/xlisp/Desktop/ocal-win/config1k.txt
+  ✓ Read
+  ✓ Read
+  ✓ Read
+
+
+配置文件看起来像校准参数(坐标 + 倍率)。让我从 exe 里提取一些字符串,搞清楚这个软件到底做什么:
+  ⏵ Bash …/OCAL1.32.exe" | head -100
+  ✓ Bash
+  ⏵ Bash …/OCAL1.32.exe" | head -200
+  ✓ Bash
+  ⏵ Bash …/OCAL1.32.exe" | grep -iE "calib|camera|fo
+  ✓ Bash
+  ⏵ Bash …/OCAL1.32.exe" | grep -E "^[A-Za-z0-9_.
+  ⏵ Bash …/OCAL1.32.exe" | grep -E "txt|ini|cfg|bmp|
+  ✓ Bash
+  ✓ Bash
+
+
+让我再深挖一下 exe,特别是 UTF-16 字符串(MFC 程序 UI 文本通常是宽字符)和繁体版,搞清楚 UI 结构:
+  ⏵ Bash …/OCAL1.32.exe',
+  ✓ Bash
+  ⏵ Bash …/OCAL1.32.exe',
+  ✓ Bash
+
+
+UI 字符串可能在资源段中或错位了。让我修正偏移再提取，并检查资源段里的对话框定义：
+  ⏵ Bash …/OCAL1.32.exe',
+  ✓ Bash
+
+
+我的解码错位了(这是 UTF-16 字节对齐问题)。让我用正确的工具——用 wrestool/hdiutil 类似的资源提取方式，改用 Python 直接解析 PE 资源段：
+  ⏵ Bash …/OCAL1
+  ✓ Bash
+
+
+有 .rsrc 资源段。现在解析 PE 资源目录，提取对话框（DIALOG）和菜单等资源：
+  ⏵ Bash …/OCAL1
+  ✓ Bash
+
+
+解析脚本有个小 bug,让我调试一下：
+  ⏵ Bash …/OCAL1
+  ✓ Bash
+
+
+我的 rva2off 映射搞错了——.rsrc 的文件偏移实际是 0xf200，但 root 在 0xf200 解析出的目录头就不对。让我先 dump 资源段开头验证：
+  ⏵ Bash …/OCAL1.32.exe"
+  ✓ Bash
+
+
+找到 bug 了——资源目录里的偏移是相对于 .rsrc 段的，不是绝对 RVA。修正后重新解析：
+  ⏵ Bash …/OCAL1
+  ✓ Bash
+
+
+太好了！找到关键资源了：
+
+ • DIALOG 102（2628 字节）— 主对话框 UI 定义
+ • DLGINIT 102 — 控件初始内容（下拉框选项）
+ • ICON、VERSION、MANIFEST
+
+现在解析 DIALOG 模板，提取所有控件和 UI 文本：
+  ⏵ Bash …/OCAL1
+  ✓ Bash
+
+
+我的结构体顺序错了。让我先 hexdump 看实际字节：
+  ⏵ Bash …/OCAL1.32.exe"
+  ✓ Bash
+
+
+找到问题了！我的结构体偏移算错了——DLGTEMPLATEEX 头部是 26 字节，我算成了 40。而且从 hexdump 能直接看到标题是 "OCAL"、字体 MS Shell Dlg 9pt、54
+个控件。修正后重新解析：
+  ⏵ Bash …/OCAL1
+  ✓ Bash
+
+
+搞清楚了! 这是一个 OCAL 准直仪校准工具(Collimator Calibration):
+
+ • 打开工业相机(4K, 3264×2448)
+ • 在实时视频上叠加绘制 3 个同心圆 + 十字准星，可调半径、粗细、颜色、角度、圆心偏移
+ • 用于光轴对准/校准
+ • 参数保存到 config<分辨率>.txt、focus.txt
+
+UI 完整提取出来了(54 个控件：开启/关闭摄像头、圈1/2/3设置、准星设置、圆心偏移、保存参数)。
+
+现在反汇编确认配置文件的确切格式和圆心计算逻辑：
+  ⏵ Bash …/
+  ✓ Bash
+  ⏵ Bash …/oc
+  ✓ Bash
+
+
+objdump 支持 coff-i386。让我搜索关键函数：fopen/fscanf 读取配置文件的逻辑（会引用 "focus.txt"、"config4k.txt" 等字符串地址）：
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+
+
+没有直接的 push 引用，搜索 VA 出现的所有位置（可能是 mov 或别的指令形式）：
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+  ⏵ Bash …/De
+  ✓ Bash
+  ⏵ Bash …/OCAL1.32.e
+  ✓ Bash
+
+
+字符串表大多是垃圾(指针表),但关键信息已拿到:错误提示"未检测到硬件，请检查连接状态后重新打开应用程序"。
+
+现在反汇编配置文件读写的核心函数,搞清楚确切格式:
+  ⏵ Bash …/Deskto
+  ✓ Bash
+
+
+现在解析 DLGINIT 资源(下拉框选项、滑块范围):
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+
+
+XML 字节错位了 1 个字节，修正一下：
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+
+
+让我直接 dump 这个 DLGINIT 的原始字节来确定布局：
+  ⏵ Bash …/OCAL1.32.exe"
+  ✓ Bash
+
+
+原来 XML 是 ASCII 单字节的。继续解析后面的 trackbar 范围设置：
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+
+
+DLGINIT 只有颜色按钮的 XML。现在搜索其他 config 文件名是如何构造的：
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+
+
+现在让我找绘图核心逻辑。先解析导入表，找到 cv::circle 和 cv::line 的 IAT 地址，然后找调用它们的绘图函数：
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+
+
+找到 IAT 入口。现在反汇编找到调用 cv::circle (0x40b5e0) 和 cv::line (0x40b5dc) 的绘图函数：
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+
+
+circle/line 是通过其他方式调用的。可能通过 C++ 包装或 thunk。让我看看调用 waitkey 的主循环 (0x404b6c) 周围的完整函数：
+  ⏵ Bash …/Deskto
+  ✓ Bash
+
+
+这段代码是视频捕获线程（0x404440 处是循环起点，cvWaitKey(30)、错误时弹 MessageBox “未检测到硬件...”）。绘图函数在别处。让我找 circle/line 的 wrapper
+thunk：
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+
+
+找到了!mov esi, [0x40b5e0] 形式的调用(先取 IAT 再 call esi)。反汇编绘图区域 0x403f00-0x404440:
+  ⏵ Bash …/Deskto
+  ✓ Bash
+
+
+我需要看这个函数的开头来理解 esi/edi 是什么函数。先找到函数起点：
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+
+
+IAT 全部解析出来了。程序用 StretchDIBits 直接在对话框上画视频帧，cvWaitKey(30) 做延时。现在看加载 config4k.txt 的第二个位置
+(0x405580)，搞清楚文件名如何按分辨率选择：
+  ⏵ Bash …/Deskto
+  ✓ Bash
+
+
+这些是 DDX_DataE‌xchange 函数(clamp 1..4)。0x405540 是保存/加载函数。继续看 0x405580 之后的保存逻辑：
+  ⏵ Bash …/Deskto
+  ✓ Bash
+  ⏵ Bash …/OCAL1.32.exe','rb').
+  ✓ Bash
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+  ⏵ Bash …/OCAL1.32.exe"
+  ✓ Bash
+
+
+让我反汇编真正的绘图函数(0x403541 附近调用 circle，0x403926 调用 line):
+  ⏵ Bash …/Deskto
+  ✓ Bash
+
+
+看主视频循环 0x404440 里的绘图逻辑：
+  ⏵ Bash …/Deskto
+  ✓ Bash
+  ⏵ Bash …/Deskto
+  ✓ Bash
+
+
+现在看到了核心绘图逻辑。让我继续看 crosshair 的几何计算、视频显示(StretchDIBits)和窗口创建：
+  ⏵ Bash …/OCAL1.
+  ✓ Bash
+
+
+现在看相机打开逻辑 (0x402134) 和 config 加载 (0x403aff) 附近的分辨率判断：
+  ⏵ Bash …/Deskto
+  ✓ Bash
+  ⏵ Bash …/Deskto
+  ✓ Bash
+
+
+我已经掌握了核心逻辑。让我看视频显示部分(StretchDIBits 在 0x4059db)和 VERSION 资源，确认视频画在哪里：
+  ⏵ Bash …/Deskto
+  ✓ Bash
+
+
+完全清楚了！视频是通过 GetDesktopWindow() + StretchDIBits 直接画到桌面上的一个覆盖窗口（通过 FindWindowA("ocal2", ...) 类窗口）——这就是 SkinMagic 换肤
++ 桌面叠加的原理。
+
+最后看 focus.txt 的读写（0x4039d0 处加载）和保存参数按钮的处理器：
+  ⏵ Bash …/Deskto
+  ✓ Bash
+
+
+现在需要确定 UI 里"圈1/圈2/圈3"与配置文件字段的对应关系。让我找 DDX 映射（DoDataExchange 函数）：
+  ⏵ Bash …/null | grep -E "\
+  ✓ Bash
+  ⏵ Bash …/null | grep -B3 "
+  ✓ Bash
+
+❯
+
