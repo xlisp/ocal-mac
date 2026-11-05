@@ -289,3 +289,30 @@ IAT 全部解析出来了。程序用 StretchDIBits 直接在对话框上画视�
 
 ❯
 
+-----------
+
+❯ 看看 codehackr_log.txt ，上次不知道为什么卡住了，继续吧！
+
+  ❯ 看看 codehackr_log.txt ，上次不知道为什么卡住了，继续吧！
+  ⏵ Read /Users/xlisp/Desktop/ocal-mac/codehackr_log.txt
+  ✓ Read
+
+看到了，上次会话是在逆向分析 ocal-win 的 OCAL 1.32 Windows 程序(准直仪校准工具),已经搞清楚了核心逻辑,最后卡在找 DDX 映射(UI 控件 ↔
+配置字段对应关系)那一步。让我先看看当前进度和文件状态，然后继续。
+  ⏵ Tool
+  ⏵ Tool
+  ✓ Tool
+  ✓ Tool
+  ⏵ Read /Users/xlisp/Desktop/ocal-win/config4k.txt
+  ⏵ Read /Users/xlisp/Desktop/ocal-win/focus.txt
+  ✓ Read
+  ✓ Read
+  ⏵ Tool
+  ✓ Tool
+  ⏵ Agent 逆向分析 OCAL1.32.exe 的 DDX 映射和配置文件字段顺序。
+
+背景:我在把一个 Windows MFC 程
+
+
+-----
+
