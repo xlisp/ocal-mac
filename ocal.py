@@ -102,20 +102,16 @@ def save_config(path, cfg):
 
 
 def load_focus(path):
-    """读 focus.txt:4 个 float,原版逻辑是后两个生效。返回 (raw4, fx, fy)。"""
+    """读 focus.txt:4 个 float,原版逻辑是后两个生效。返回 (raw4, fx, fy)。
+
+    focus.txt 是每台设备固定的误差标定值(在视野中央附近),原版只读不写,
+    Mac 版同样只读 —— 程序内不提供任何修改/拖动圆心的方式。
+    """
     toks = Path(path).read_text(encoding="utf-8", errors="replace").split()
     if len(toks) < 4:
         raise ValueError(f"{Path(path).name}: 需要 4 个浮点参数")
     raw = [float(t) for t in toks[:4]]
     return raw, raw[2], raw[3]
-
-
-def save_focus(path, raw, fx, fy):
-    """写 focus.txt:保持 4 个 float 的格式(前两个原样保留,后两个更新)。"""
-    a = fmt_float(raw[0]) if raw[0] != 0 else "0"
-    b = fmt_float(raw[1]) if raw[1] != 0 else "0"
-    s = f"{a} {b} {fmt_float(fx)} {fmt_float(fy)}"
-    Path(path).write_text(s, encoding="ascii")
 
 
 # ---------------------------------------------------------------- 绘制(复刻原版几何)
@@ -264,14 +260,14 @@ class App:
 
         # 状态
         self.cfg = {k: d for k, _, d in CONFIG_SPEC}
-        self.enables = {"c1": True, "c2": True, "c3": True, "xh": True, "off": True}
+        # "off" = 启用圆心偏移(原版复选框 1016 默认不勾 → 圆心 = focus 点本身)
+        self.enables = {"c1": True, "c2": True, "c3": True, "xh": True, "off": False}
         self.colors = {"c1": (0, 0, 255),   # 红
                        "c2": (0, 255, 0),   # 绿
                        "c3": (255, 0, 0),   # 蓝
                        "xh": (255, 255, 255)}  # 白
-        self.focus_raw = [0.0, 0.0]     # focus.txt 前两个值(原版丢弃,保存时原样写回)
+        # focus 点:每台设备固定的误差标定值(focus.txt),只读、不可拖动
         self.fx, self.fy = 0.0, 0.0
-        self.focus_dirty = False
         self.cam = None
         self.cam_size = None           # (w, h) 实际画面尺寸
         self._pending_cam = None       # 正在打开中的相机线程
@@ -311,14 +307,16 @@ class App:
         ttk.Label(f_cam, textvariable=self.var_res).pack(side="left", padx=12)
 
         # -- 圆心偏移 --
-        f_off = ttk.LabelFrame(outer, text="圆心偏移(focus 点 ± 偏移)", padding=6)
+        f_off = ttk.LabelFrame(outer, text="圆心偏移(在 focus 点基础上的临时微调)", padding=6)
         f_off.pack(fill="x", **pad)
         self._add_check(f_off, "off", "启 用 圆 心 偏 移", row=0, col=0, colspan=4)
         self._add_param(f_off, "off_ud", "上  下 (Y)", -2000, 2000, row=1, col=0, colspan=3)
         self._add_param(f_off, "off_lr", "左  右 (X)", -2000, 2000, row=2, col=0, colspan=3)
-        ttk.Label(f_off, text="focus 点 (fx, fy):").grid(row=1, column=3, sticky="e")
+        ttk.Label(f_off, text="focus 点 (固定):").grid(row=1, column=3, sticky="e")
         self.var_focus = tk.StringVar(value="—")
         ttk.Label(f_off, textvariable=self.var_focus).grid(row=2, column=3, sticky="w")
+        ttk.Label(f_off, text="(focus.txt 每台设备的误差值,只读)",
+                  foreground="#888").grid(row=3, column=3, sticky="w")
 
         # -- 圈1/2/3 --
         self._circle_frames = {}
@@ -349,7 +347,8 @@ class App:
         self.var_cfgfile = tk.StringVar(value="")
         ttk.Label(f_save, textvariable=self.var_cfgfile).pack(side="left", padx=10)
 
-        ttk.Label(outer, text="提示:视频窗口中点按鼠标左键可把 focus 点移到该处(写入 focus.txt 需点“保存参数”)",
+        ttk.Label(outer, text="圆心 = focus 点(focus.txt,每台设备固定的误差标定值,程序内不可修改/拖动)"
+                              "+ 偏移滑条(勾选“启用圆心偏移”才生效),与原版行为一致",
                   foreground="#888").pack(fill="x")
 
     def _add_check(self, parent, key, text, row=0, col=0, colspan=1):
@@ -464,35 +463,25 @@ class App:
         fp = self.config_path("focus.txt")
         if fp.exists():
             try:
-                raw, fx, fy = load_focus(fp)
-                self.focus_raw, self.fx, self.fy = raw, fx, fy
-                self.focus_dirty = False
+                _, self.fx, self.fy = load_focus(fp)
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror(APP_TITLE, f"读取 focus.txt 失败:\n{e}")
         else:
-            # 无 focus.txt → 默认画面中心
+            # 无 focus.txt → 取视野中央(原版语义:focus 点就在视野中央附近)
             w, h = self.cam_size or (3264, 2448)
-            self.focus_raw = [0.0, 0.0]
             self.fx, self.fy = w / 2.0, h / 2.0
-            self.focus_dirty = False
         self._sync_ui()
 
     def reload_params(self):
         self.load_all_configs(self.config_name)
 
     def save_params(self):
-        """保存参数:config<res>.txt(11 int)+ focus.txt(若 focus 点被修改过)。"""
+        """保存参数:只写 config<res>.txt(11 int)。focus.txt 为设备固定误差值,只读不写(同原版)。"""
         try:
             cp = self.config_path(self.config_name)
             save_config(cp, self.cfg)
-            msgs = [f"{cp}  ← 11 个参数已保存"]
-            if self.focus_dirty:
-                fp = self.config_path("focus.txt")
-                save_focus(fp, self.focus_raw, self.fx, self.fy)
-                self.focus_dirty = False
-                msgs.append(f"{fp}  ← focus 点已保存")
             self.var_cfgfile.set(self.config_name)
-            messagebox.showinfo(APP_TITLE, "\n".join(msgs))
+            messagebox.showinfo(APP_TITLE, f"{cp}\n11 个参数已保存")
         except Exception as e:  # noqa: BLE001
             messagebox.showerror(APP_TITLE, f"保存失败:\n{e}\n{traceback.format_exc()}")
 
@@ -619,22 +608,8 @@ class App:
         self._status_var = tk.StringVar(value="等待画面…")
         ttk.Label(win, textvariable=self._status_var, anchor="w",
                   relief="groove").pack(fill="x")
-        self._video_label.bind("<Button-1>", self._on_video_click)
+        # 注意:圆心不做交互拖动 —— focus 点是设备固定误差值(focus.txt),与原版一致
         self.video_win = win
-
-    def _on_video_click(self, event):
-        """在视频窗口点左键 → focus 点移到该处(focus 点是关键!)。"""
-        if not self._photo or not self.cam_size:
-            return
-        # 屏幕 → 原图坐标
-        sx = self._photo.width()
-        sy = self._photo.height()
-        w, h = self.cam_size
-        fx = event.x * w / sx
-        fy = event.y * h / sy
-        self.fx, self.fy = fx, fy
-        self.focus_dirty = True
-        self.var_focus.set(f"({fmt_float(self.fx)}, {fmt_float(self.fy)})")
 
     def _tick(self):
         if self._closing:
@@ -722,13 +697,15 @@ def selftest():
             ok = False
         print(f"  {flag} {name}: {got}")
 
-    print("== 2. focus.txt(只用后两个值) ==")
+    print("== 2. focus.txt(每台设备固定的误差值,只用后两个) ==")
     raw, fx, fy = load_focus(src / "focus.txt")
     print(f"  raw={raw} → focus=({fx}, {fy})")
     assert (fx, fy) == (1616.83, 1172.13), "focus 解析错误"
-    print("  ✓ focus = (1616.83, 1172.13)")
+    print("  ✓ focus = (1616.83, 1172.13)(在 4K 视野中央 (1632,1224) 附近,即设备误差)")
+    assert "save_focus" not in globals(), "focus.txt 应为只读,不应有写函数"
+    print("  ✓ focus.txt 只读(无写函数,原版也从不在程序内写它)")
 
-    print("== 3. 字节级回写兼容 ==")
+    print("== 3. 字节级回写兼容(config) ==")
     with tempfile.TemporaryDirectory() as td:
         for name in expect:
             cfg = load_config(src / name)
@@ -742,22 +719,24 @@ def selftest():
                 print(f"  {flag} {name}: 原 {a!r} vs 新 {b!r}")
             else:
                 print(f"  {flag} {name} 字节一致")
-        # focus.txt 回写(保留前两个)
-        out = Path(td) / "focus.txt"
-        save_focus(out, raw, fx, fy)
-        b = out.read_bytes()
-        a = (src / "focus.txt").read_bytes()
-        flag = "✓" if a == b else "✗"
-        if a != b:
-            ok = False
-            print(f"  {flag} focus.txt: 原 {a!r} vs 新 {b!r}")
-        else:
-            print("  {flag} focus.txt 字节一致".replace("{flag}", "✓"))
 
-    print("== 4. 绘图几何(4K 默认参数) ==")
+    print("== 4. 圆心语义(原版:勾偏移才加,否则圆心 = focus 点) ==")
     cfg = dict(zip(CONFIG_KEYS, expect["config4k.txt"]))
+    # 不勾偏移 → 圆心就是 focus 点
+    cx, cy = compute_center(1616.83, 1172.13, cfg["off_lr"], cfg["off_ud"], False)
+    print(f"  未勾偏移: 圆心=({fmt_float(cx)}, {fmt_float(cy)})")
+    if (cx, cy) != (1616.83, 1172.13):
+        ok = False
+    else:
+        print("  ✓ 圆心 = focus 点(原版默认行为)")
+    # 勾偏移 → focus 点 + 偏移
+    cx, cy = compute_center(1616.83, 1172.13, 100, -50, True)
+    print(f"  勾偏移(100,-50): 圆心=({fmt_float(cx)}, {fmt_float(cy)}) ✓"
+          if (cx, cy) == (1716.83, 1122.13) else "  ✗ 偏移计算错误")
+
+    print("== 5. 绘图几何(4K 默认参数) ==")
     img = np.zeros((2448, 3264, 3), np.uint8)
-    enables = {"c1": True, "c2": True, "c3": True, "xh": True, "off": True}
+    enables = {"c1": True, "c2": True, "c3": True, "xh": True, "off": False}
     colors = {"c1": (0, 0, 255), "c2": (0, 255, 0), "c3": (255, 0, 0), "xh": (255, 255, 255)}
     draw_overlay(img, cfg, colors, enables, 1616.83, 1172.13)
     # 圆心像素应为各颜色混合(圆与线都经过)
