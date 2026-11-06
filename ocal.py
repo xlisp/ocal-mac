@@ -50,6 +50,8 @@ RESOLUTIONS = [
     ("1K  1024×768", (1024, 768), "config1k.txt"),
 ]
 DEFAULT_CONFIG = "config4k.txt"  # 原版默认
+CONFIG_RES = {name: (w, h) for _, (w, h), name in RESOLUTIONS}  # 配置文件 ↔ 分辨率
+FOCUS_REF = (3264.0, 2448.0)  # focus.txt 的采样基准:OCAL 4K 设备
 
 # 11 个配置字段:(键, 说明, 默认值)
 CONFIG_SPEC = [
@@ -116,16 +118,35 @@ def load_focus(path):
 
 # ---------------------------------------------------------------- 绘制(复刻原版几何)
 
-def compute_center(fx, fy, off_lr, off_ud, off_enabled):
-    """原版:勾选圆心偏移时 x = fx + 左右(v11), y = fy + 上下(v10);否则直接 (fx, fy)。"""
-    if off_enabled:
-        return fx + off_lr, fy + off_ud
-    return fx, fy
+def overlay_geometry(cfg, enables, fx, fy, config_name, frame_w, frame_h):
+    """把 focus.txt / config 参数换算到实际帧坐标。
+
+    focus.txt 是按 OCAL 4K 设备(FOCUS_REF = 3264×2448)标定的每台设备误差值;
+    config<res>.txt 的参数属于该配置对应的分辨率。若相机实际给出的分辨率不同
+    (UVC 默认常是 640×480 等),按比例换算,保证圆心始终落在视野中央附近 ——
+    与原版在 4K 相机上的视觉效果一致。分辨率恰好匹配时为恒等换算(逐字节
+    等于原版)。
+
+    返回 (cx, cy, kx):圆心(帧坐标)与 config→帧 的横向比例。
+    """
+    kfx, kfy = frame_w / FOCUS_REF[0], frame_h / FOCUS_REF[1]   # focus(4K 基准)→ 帧
+    cw, ch = CONFIG_RES.get(config_name, FOCUS_REF)             # config 对应的分辨率
+    kx, ky = frame_w / cw, frame_h / ch                         # config → 帧
+    fx_s, fy_s = fx * kfx, fy * kfy
+    if enables.get("off"):
+        cx, cy = fx_s + cfg["off_lr"] * kx, fy_s + cfg["off_ud"] * ky
+    else:
+        cx, cy = fx_s, fy_s
+    return cx, cy, kx
 
 
-def draw_overlay(img, cfg, colors, enables, fx, fy):
-    """在帧上画 3 个同心圆 + 十字准星,几何/参数与原版一致。"""
-    cx, cy = compute_center(fx, fy, cfg["off_lr"], cfg["off_ud"], enables["off"])
+def draw_overlay(img, cfg, colors, enables, fx, fy, config_name):
+    """在帧上画 3 个同心圆 + 十字准星,几何/参数与原版一致(含分辨率换算)。
+
+    返回绘制圆心 (cx, cy)(帧坐标)。
+    """
+    h, w = img.shape[:2]
+    cx, cy, kx = overlay_geometry(cfg, enables, fx, fy, config_name, w, h)
     # OpenCV 需要整数圆心(原版用 fistp 取整)
     cx_i, cy_i = int(round(cx)), int(round(cy))
 
@@ -133,28 +154,28 @@ def draw_overlay(img, cfg, colors, enables, fx, fy):
     for ck in CIRCLE_KEYS:
         if not enables[ck]:
             continue
-        r = int(cfg[f"{ck}_r"])
-        w = int(cfg[f"{ck}_w"])
+        r = int(round(cfg[f"{ck}_r"] * kx))
+        t = int(cfg[f"{ck}_w"])
         if r <= 0:
             continue
-        cv2.circle(img, (cx_i, cy_i), r, colors[ck], max(1, w), cv2.LINE_AA)
+        cv2.circle(img, (cx_i, cy_i), r, colors[ck], max(1, t), cv2.LINE_AA)
 
     # --- 十字准星:过中心、角度 a = v9/10° 的两条互相垂直线,半长 = v7
     if enables["xh"]:
-        L = float(cfg["xh_len"])
-        w = max(1, int(cfg["xh_w"]))
+        L = float(cfg["xh_len"]) * kx
+        t = max(1, int(cfg["xh_w"]))
         a = math.radians(cfg["xh_ang"] / 10.0)
         for ang in (a, a + math.pi / 2):
             dx = L * math.sin(ang)
             dy = L * math.cos(ang)
             p1 = (int(round(cx - dx)), int(round(cy - dy)))
             p2 = (int(round(cx + dx)), int(round(cy + dy)))
-            cv2.line(img, p1, p2, colors["xh"], w, cv2.LINE_AA)
+            cv2.line(img, p1, p2, colors["xh"], t, cv2.LINE_AA)
 
-    # focus 点标记(白色小点,便于确认基准位置)
+    # focus 点标记(白色小十字,便于确认基准位置)
     cv2.drawMarker(img, (cx_i, cy_i), (255, 255, 255),
                    markerType=cv2.MARKER_CROSS, markerSize=10, thickness=1)
-    return img
+    return cx, cy
 
 
 # ---------------------------------------------------------------- 相机线程
@@ -195,6 +216,11 @@ class CameraThread(threading.Thread):
                 self.error = f"无法打开摄像头 {self.index}"
                 return
             if self.want_size:
+                # 不少 USB 工业相机只有 MJPG 才出高分辨率,先请求 MJPG 再设分辨率
+                try:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                except Exception:  # noqa: BLE001
+                    pass
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.want_size[0])
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.want_size[1])
             while not self.stop_flag.is_set():
@@ -272,6 +298,8 @@ class App:
         self.cam_size = None           # (w, h) 实际画面尺寸
         self._pending_cam = None       # 正在打开中的相机线程
         self.test_mode = False
+        self._cam_index = 0
+        self._cam_want_size = (3264, 2448)  # 默认请求 4K(OCAL 相机原生分辨率)
         self.config_name = DEFAULT_CONFIG
         self._ui_vars = {}
         self._closing = False
@@ -467,9 +495,8 @@ class App:
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror(APP_TITLE, f"读取 focus.txt 失败:\n{e}")
         else:
-            # 无 focus.txt → 取视野中央(原版语义:focus 点就在视野中央附近)
-            w, h = self.cam_size or (3264, 2448)
-            self.fx, self.fy = w / 2.0, h / 2.0
+            # 无 focus.txt → 取 4K 基准的视野中央(换算后即落在当前帧中央)
+            self.fx, self.fy = FOCUS_REF[0] / 2.0, FOCUS_REF[1] / 2.0
         self._sync_ui()
 
     def reload_params(self):
@@ -492,7 +519,8 @@ class App:
         want = getattr(self, "_cam_want_size", None)
         self.cam_stop()
         self.test_mode = False
-        self.var_res.set(f"正在打开摄像头 {idx} …(USB 工业相机首次可能要几秒)")
+        want_txt = f",请求 {want[0]}×{want[1]}" if want else ""
+        self.var_res.set(f"正在打开摄像头 {idx}{want_txt} …(USB 工业相机首次可能要几秒)")
         cam = CameraThread(idx, want)
         cam.start()
         self._pending_cam = cam
@@ -550,8 +578,12 @@ class App:
             self.load_all_configs(name)
         else:
             self._sync_ui()
-        self.var_res.set(f"分辨率 {self.cam_size[0]}×{self.cam_size[1]}"
-                         + ("(模拟)" if self.test_mode else ""))
+        note = ""
+        want = getattr(self, "_cam_want_size", None)
+        if not self.test_mode and want and (w, h) != tuple(want):
+            note = (f" | 相机实际 {w}×{h},未达请求 {want[0]}×{want[1]}"
+                    "(已按比例换算,圆心保持在视野中央)")
+        self.var_res.set(f"分辨率 {w}×{h}" + ("(模拟)" if self.test_mode else "") + note)
 
     def cam_stop(self):
         self._pending_cam = None  # 让打开轮询停止跟随
@@ -575,17 +607,19 @@ class App:
         cb_idx.grid(row=0, column=1, sticky="w", padx=8)
 
         ttk.Label(frm, text="分辨率").grid(row=1, column=0, sticky="w")
-        var_res = tk.StringVar(
-            value=[r[0] for r in RESOLUTIONS if r[1] == getattr(self, "_cam_want_size", None)][0]
-            if any(r[1] == getattr(self, "_cam_want_size", None) for r in RESOLUTIONS) else "自动")
-        cb_res = ttk.Combobox(frm, textvariable=var_res, width=14,
-                              values=["自动"] + [r[0] for r in RESOLUTIONS], state="readonly")
+        res_by_label = {r[0]: r[1] for r in RESOLUTIONS}
+        label_by_size = {r[1]: r[0] for r in RESOLUTIONS}
+        cur = getattr(self, "_cam_want_size", None) or (3264, 2448)
+        var_res = tk.StringVar(value=label_by_size.get(cur, "自动(相机默认)"))
+        cb_res = ttk.Combobox(frm, textvariable=var_res, width=16,
+                              values=["自动(相机默认)"] + [r[0] for r in RESOLUTIONS],
+                              state="readonly")
         cb_res.grid(row=1, column=1, sticky="w", padx=8)
 
         def apply():
             self._cam_index = int(var_idx.get())
-            self._cam_want_size = None if var_res.get() == "自动" else \
-                dict((r[0], r[1]) for r in RESOLUTIONS)[var_res.get()]
+            pick = var_res.get()
+            self._cam_want_size = None if pick.startswith("自动") else res_by_label[pick]
             win.destroy()
             self.cam_start()
 
@@ -642,7 +676,8 @@ class App:
                 self._video_label.configure(image="")
             return
 
-        draw_overlay(frame, self.cfg, self.colors, self.enables, self.fx, self.fy)
+        cx, cy = draw_overlay(frame, self.cfg, self.colors, self.enables,
+                              self.fx, self.fy, self.config_name)
 
         # 缩放显示(最大 1280 宽 / 820 高,保持比例)
         w, h = self.cam_size
@@ -659,11 +694,9 @@ class App:
         self._photo = ImageTk.PhotoImage(pil)
         self._video_label.configure(image=self._photo)
 
-        cx, cy = compute_center(self.fx, self.fy, self.cfg["off_lr"],
-                                self.cfg["off_ud"], self.enables["off"])
         self._status_var.set(
-            f"画面 {w}×{h} | focus ({fmt_float(self.fx)}, {fmt_float(self.fy)})"
-            f" | 绘制中心 ({fmt_float(cx)}, {fmt_float(cy)})"
+            f"画面 {w}×{h} | focus ({fmt_float(self.fx)}, {fmt_float(self.fy)})(4K 基准)"
+            f" | 绘制圆心 ({fmt_float(cx)}, {fmt_float(cy)})"
             f" | 配置 {self.config_name}")
 
     # ---------------------------------------------------------- 退出
@@ -720,25 +753,50 @@ def selftest():
             else:
                 print(f"  {flag} {name} 字节一致")
 
-    print("== 4. 圆心语义(原版:勾偏移才加,否则圆心 = focus 点) ==")
+    print("== 4. 圆心换算(4K 相机上恒等 = 原版;其他分辨率自动居中) ==")
     cfg = dict(zip(CONFIG_KEYS, expect["config4k.txt"]))
-    # 不勾偏移 → 圆心就是 focus 点
-    cx, cy = compute_center(1616.83, 1172.13, cfg["off_lr"], cfg["off_ud"], False)
-    print(f"  未勾偏移: 圆心=({fmt_float(cx)}, {fmt_float(cy)})")
-    if (cx, cy) != (1616.83, 1172.13):
+    enables = {"c1": True, "c2": True, "c3": True, "xh": True, "off": False}
+
+    # 4K 相机 + config4k → 恒等换算,圆心 = focus 点(与原版逐字节一致)
+    cx, cy, kx = overlay_geometry(cfg, enables, 1616.83, 1172.13, "config4k.txt", 3264, 2448)
+    print(f"  4K 实拍: 圆心=({fmt_float(cx)}, {fmt_float(cy)}), kx={kx}")
+    if (cx, cy) != (1616.83, 1172.13) or kx != 1.0:
         ok = False
     else:
-        print("  ✓ 圆心 = focus 点(原版默认行为)")
-    # 勾偏移 → focus 点 + 偏移
-    cx, cy = compute_center(1616.83, 1172.13, 100, -50, True)
-    print(f"  勾偏移(100,-50): 圆心=({fmt_float(cx)}, {fmt_float(cy)}) ✓"
-          if (cx, cy) == (1716.83, 1122.13) else "  ✗ 偏移计算错误")
+        print("    ✓ 恒等换算(4K 下与原版二进制行为一致)")
 
-    print("== 5. 绘图几何(4K 默认参数) ==")
+    # 相机只给 640×480(UVC 默认)→ config 回退 config4k,圆心换算到视野中央附近
+    cx, cy, kx = overlay_geometry(cfg, enables, 1616.83, 1172.13, "config4k.txt", 640, 480)
+    print(f"  640×480 实拍: 圆心=({fmt_float(cx)}, {fmt_float(cy)})(视野中央 320,240), kx={kx:.3f}")
+    if not (abs(cx - 320) < 30 and abs(cy - 240) < 25):
+        ok = False
+    else:
+        print("    ✓ 低分辨率下圆心仍居中")
+
+    # 1080P 相机 + config1080 → focus 点按 4K 基准缩放
+    cfg1080 = dict(zip(CONFIG_KEYS, expect["config1080.txt"]))
+    cx, cy, kx = overlay_geometry(cfg1080, enables, 1616.83, 1172.13, "config1080.txt", 1920, 1080)
+    print(f"  1080P 实拍: 圆心=({fmt_float(cx)}, {fmt_float(cy)})(视野中央 960,540), kx={kx}")
+    if not (abs(cx - 960) < 40 and abs(cy - 540) < 40 and kx == 1.0):
+        ok = False
+    else:
+        print("    ✓ 1080P 下圆心居中,config 参数不缩放")
+
+    # 勾偏移 → 圆心 = focus 点 + 偏移(4K 恒等下与原版数值一致)
+    e2 = dict(enables, off=True)
+    cfg_off = dict(cfg, off_lr=100, off_ud=-50)
+    cx, cy, _ = overlay_geometry(cfg_off, e2, 1616.83, 1172.13, "config4k.txt", 3264, 2448)
+    print(f"  勾偏移(100,-50) @4K: 圆心=({fmt_float(cx)}, {fmt_float(cy)})")
+    if (cx, cy) != (1716.83, 1122.13):
+        ok = False
+    else:
+        print("    ✓ 偏移生效(同原版)")
+
+    print("== 5. 绘图几何(4K 默认参数,恒等换算) ==")
     img = np.zeros((2448, 3264, 3), np.uint8)
-    enables = {"c1": True, "c2": True, "c3": True, "xh": True, "off": False}
     colors = {"c1": (0, 0, 255), "c2": (0, 255, 0), "c3": (255, 0, 0), "xh": (255, 255, 255)}
-    draw_overlay(img, cfg, colors, enables, 1616.83, 1172.13)
+    cfg2 = dict(zip(CONFIG_KEYS, expect["config4k.txt"]))
+    draw_overlay(img, cfg2, colors, enables, 1616.83, 1172.13, "config4k.txt")
     # 圆心像素应为各颜色混合(圆与线都经过)
     px = img[1172, 1616]
     print(f"  中心像素 BGR={tuple(int(v) for v in px)}(应为非零,圆+十字叠加)")
