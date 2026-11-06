@@ -164,7 +164,14 @@ def draw_overlay(img, cfg, colors, enables, fx, fy):
 # ---------------------------------------------------------------- 相机线程
 
 class CameraThread(threading.Thread):
-    """后台取流线程。失败时置 self.error 并退出。"""
+    """后台取流线程。打开失败/持续取不到帧时置 self.error 并退出。
+
+    尺寸从首帧获取(cap.get 在 AVFoundation 下可能返回 0 或阻塞),
+    兼容 USB 工业相机首次协商较慢的情况。
+    """
+
+    OPEN_FAIL_LIMIT = 150    # 开启阶段连续取不到帧的上限(~3s)→ 报"未检测到硬件"
+    RUN_FAIL_LIMIT = 500     # 运行中断流上限(~10s)
 
     def __init__(self, index=0, want_size=None):
         super().__init__(daemon=True)
@@ -177,28 +184,53 @@ class CameraThread(threading.Thread):
         self.real_size = None
 
     def run(self):
+        cap = None
+        fails = 0
         try:
-            cap = cv2.VideoCapture(self.index, cv2.CAP_AVFOUNDATION)
+            try:
+                cap = cv2.VideoCapture(self.index, cv2.CAP_AVFOUNDATION)
+            except Exception as e:  # noqa: BLE001
+                self.error = f"打开摄像头 {self.index} 异常: {e}"
+                return
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(self.index)  # 其他后端再试一次
+            if not cap.isOpened():
+                self.error = f"无法打开摄像头 {self.index}"
+                return
+            if self.want_size:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.want_size[0])
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.want_size[1])
+            while not self.stop_flag.is_set():
+                try:
+                    ok, frame = cap.read()
+                except Exception as e:  # noqa: BLE001
+                    self.error = f"取流异常: {e}"
+                    return
+                if not ok or frame is None or frame.size == 0:
+                    fails += 1
+                    if self.frame is None and fails >= self.OPEN_FAIL_LIMIT:
+                        self.error = ("未检测到硬件，请检查连接状态后重新打开应用程序\n"
+                                      f"(摄像头 {self.index} 无法取流)")
+                        return
+                    if self.frame is not None and fails >= self.RUN_FAIL_LIMIT:
+                        self.error = "取流中断(摄像头已断开?)"
+                        return
+                    time.sleep(0.02)
+                    continue
+                fails = 0
+                if self.real_size is None:
+                    self.real_size = (int(frame.shape[1]), int(frame.shape[0]))
+                with self.lock:
+                    self.frame = frame
         except Exception as e:  # noqa: BLE001
-            self.error = str(e)
-            return
-        if not cap.isOpened():
-            cap.release()
-            self.error = f"无法打开摄像头 {self.index}"
-            return
-        if self.want_size:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.want_size[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.want_size[1])
-        self.real_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                          int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        while not self.stop_flag.is_set():
-            ok, frame = cap.read()
-            if not ok:
-                time.sleep(0.01)
-                continue
-            with self.lock:
-                self.frame = frame
-        cap.release()
+            self.error = f"相机线程异常: {e}"
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def get(self):
         with self.lock:
@@ -242,6 +274,7 @@ class App:
         self.focus_dirty = False
         self.cam = None
         self.cam_size = None           # (w, h) 实际画面尺寸
+        self._pending_cam = None       # 正在打开中的相机线程
         self.test_mode = False
         self.config_name = DEFAULT_CONFIG
         self._ui_vars = {}
@@ -469,32 +502,60 @@ class App:
         idx = getattr(self, "_cam_index", 0)
         want = getattr(self, "_cam_want_size", None)
         self.cam_stop()
+        self.test_mode = False
+        self.var_res.set(f"正在打开摄像头 {idx} …(USB 工业相机首次可能要几秒)")
         cam = CameraThread(idx, want)
         cam.start()
-        # 等待打开结果
-        for _ in range(60):
-            if cam.error or cam.real_size:
-                break
-            time.sleep(0.05)
-        if cam.error:
+        self._pending_cam = cam
+        self.root.after(100, lambda: self._poll_camera_open(cam, 0))
+
+    def _poll_camera_open(self, cam, tries):
+        """非阻塞等待相机出画面,不卡 UI、不因慢相机崩溃。"""
+        if self._closing or self._pending_cam is not cam:
+            return  # 已被关闭/替换
+        if cam.error or cam.frame is not None:
+            self._pending_cam = None
+            if cam.error:
+                cam.stop()
+                self.var_res.set("未开启")
+                self._offer_fallback(cam.error)
+                return
+            # 成功:尺寸以首帧为准(避免 cap.get 返回 0/None)
+            size = cam.real_size
+            if not size and cam.frame is not None:
+                size = (cam.frame.shape[1], cam.frame.shape[0])
+            self.cam = cam
+            self._after_camera_open(size)
+            return
+        if tries >= 150:  # ~15 秒仍无画面
+            self._pending_cam = None
             cam.stop()
             self.var_res.set("未开启")
-            if messagebox.askyesno(
-                    APP_TITLE,
-                    "未检测到硬件,请检查连接状态后重新打开应用程序。\n\n"
-                    "要使用模拟画面继续吗?(用于没有工业相机时调试参数)"):
-                self.test_mode = True
-                w, h = want or (1920, 1080)
-                self.cam_size = (w, h)
-                self.cam = None
-                self._after_camera_open((w, h))
+            self._offer_fallback(
+                f"打开摄像头 {cam.index} 超时(约 15 秒无画面)。\n"
+                "请检查:\n"
+                "  1. USB 线已连接、相机已供电\n"
+                "  2. 系统设置 → 隐私与安全性 → 摄像头,允许终端/python\n"
+                "  3. 其他软件(如原 Windows 版/会议软件)是否占用相机")
             return
-        self.test_mode = False
-        self.cam = cam
-        self._after_camera_open(cam.real_size)
+        self.root.after(100, lambda: self._poll_camera_open(cam, tries + 1))
+
+    def _offer_fallback(self, err):
+        """相机不可用时:提示错误,可选模拟画面继续(不影响参数调试)。"""
+        if messagebox.askyesno(APP_TITLE, err + "\n\n要使用模拟画面继续吗?"):
+            w, h = getattr(self, "_cam_want_size", None) or (1920, 1080)
+            self.test_mode = True
+            self.cam_size = (w, h)
+            self.cam = None
+            self._after_camera_open((w, h))
+            self.var_res.set(f"分辨率 {w}×{h}(模拟)")
 
     def _after_camera_open(self, size):
-        self.cam_size = (int(size[0]), int(size[1]))
+        size = size or (1920, 1080)
+        w, h = int(size[0]), int(size[1])
+        if w <= 0 or h <= 0:
+            w, h = 1920, 1080
+        self.cam_size = (w, h)
         name = find_config_file(self.cam_size)
         if name != self.config_name:
             self.load_all_configs(name)
@@ -504,6 +565,7 @@ class App:
                          + ("(模拟)" if self.test_mode else ""))
 
     def cam_stop(self):
+        self._pending_cam = None  # 让打开轮询停止跟随
         if self.cam:
             self.cam.stop()
             self.cam.join(timeout=1.0)
@@ -592,7 +654,11 @@ class App:
             frame = make_test_pattern(w, h)
         elif self.cam:
             frame = self.cam.get()
-            if frame is None:
+            if self.cam.error:
+                self._status_var.set(f"⚠ 画面中断: {self.cam.error}")
+                if frame is None:
+                    return
+            elif frame is None:
                 self._status_var.set("等待画面…")
                 return
         else:
